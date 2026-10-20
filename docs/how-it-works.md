@@ -1,0 +1,142 @@
+# How It Works
+
+[← Back to README](../README.md) ·
+[Usage Guide](usage.md)
+
+## Profiling Pipeline
+
+Lazyline wraps [line_profiler](https://github.com/pyutils/line_profiler)
+and orchestrates a seven-step pipeline:
+
+### 1. Discovery
+
+Imports the target scope and walks all submodules via
+`pkgutil.walk_packages()`, supplemented with filesystem scanning
+for implicit namespace packages (directories without `__init__.py`).
+
+### 2. Registration
+
+Registers every Python function with `line_profiler`'s
+`LineProfiler.add_module()`. C extension functions are skipped
+(no Python bytecode to trace). Wrappers like `lru_cache` and
+callable wrapper instances are auto-unwrapped to reach the
+underlying function.
+
+### 3. Execution
+
+Runs the user's command with profiling enabled. `line_profiler`
+uses `sys.monitoring` (Python 3.12+) or `sys.settrace` (older
+versions) for deterministic per-line tracing.
+
+### 4. Collection
+
+Extracts per-line timing data from `line_profiler` and filters
+out stdlib wrapper leaks via scope path matching.
+
+### 5. Memory tracking (optional)
+
+When `--memory` is passed, `tracemalloc` takes before/after
+snapshots and computes per-line net allocation deltas.
+
+### 6. Multiprocessing
+
+`concurrent.futures.ProcessPoolExecutor` and `multiprocessing.Pool`
+worker processes are automatically profiled with per-worker
+`LineProfiler` instances. Stats are merged after execution via
+pickle files in a temporary directory.
+
+### 7. Subprocess injection
+
+If the command spawns child Python processes (e.g., Celery workers,
+Airflow tasks), lazyline injects a `sitecustomize.py` bootstrap
+via `PYTHONPATH` so child interpreters profile the same scope
+automatically.
+
+## Overhead and Limitations
+
+### Deterministic vs. sampling
+
+Deterministic tracing (lazyline, line_profiler, cProfile) fires a
+callback on every line or function call, measuring exact execution
+counts and times. Sampling profilers (Scalene, py-spy) periodically
+interrupt the program and record where it is — much lower overhead,
+but statistical approximations rather than exact counts.
+
+### Wall-clock time, not CPU time
+
+`line_profiler` measures **wall-clock time**. Time spent waiting on
+I/O (network, disk, `time.sleep`) is indistinguishable from CPU-heavy
+computation. A line that reads a large file will show the same kind of
+timing as a line doing heavy math. Keep this in mind when interpreting
+results — high time on an I/O line is expected, not a bug.
+
+### Overhead characteristics
+
+Lazyline's deterministic approach means overhead depends on how many
+line executions occur in profiled functions:
+
+- **Functions with meaningful work (>0.1ms per call):** negligible
+  overhead (~1.2x).
+- **Tight loops calling tiny functions millions of times:** overhead
+  can reach ~7x wall-clock and ~9x reported-time inflation.
+- **Registering uncalled functions:** zero measurable overhead.
+  The cost comes entirely from per-line callbacks in functions
+  that actually execute.
+
+**Relative rankings are always reliable.** If function A appears 10x
+slower than function B, that ratio holds regardless of overhead. Use
+lazyline to find *which* code is slowest, not to measure absolute
+execution time.
+
+Lazyline warns when a function exceeds 1M total line hits, as
+reported times for such functions are unreliable.
+
+### Memory mode overhead
+
+`tracemalloc` hooks every `malloc` and `free` call. Code doing many
+small allocations (JSON serialization, string formatting) can see
+20x+ additional wall-clock cost. Code with few allocations (numeric
+loops) sees ~39% extra. Use `--memory` only when you need allocation
+data, not as a default.
+
+> **Warning:** When `--memory` is active, **timing data becomes
+> unreliable** for allocation-heavy code. The `tracemalloc` overhead
+> inflates wall-clock time unevenly — lines that allocate more appear
+> disproportionately slower. If you need accurate timing, run without
+> `--memory` first, then run a separate `--memory` pass for allocation
+> data.
+
+**Memory measurements are not inflated** by line-profiler tracing.
+`tracemalloc` hooks the memory allocator separately. However,
+`tracemalloc` adds ~30% memory overhead for its own bookkeeping.
+
+### Known limitations
+
+- **Threading:** `line_profiler`'s tracing hook
+  (`sys.settrace`/`sys.monitoring`) is per-thread — only the thread
+  that calls `enable_by_count()` is traced (the main thread).
+  Unlike multiprocessing, where lazyline injects per-process
+  profilers into worker entry points, there is no equivalent
+  hook point for threads. Work done in `threading.Thread` or
+  `ThreadPoolExecutor` will not appear in results.
+- **Generators and `yield`:** `line_profiler` has a known issue
+  where time spent in the *caller* between `yield` resumptions
+  can be attributed to the `yield` line itself. If a generator
+  function shows unexpectedly high time on a `yield` line, this
+  is likely the cause rather than the generator being slow.
+- **Multiprocessing start method:** `ProcessPoolExecutor` and
+  `multiprocessing.Pool` profiling requires the `fork` start
+  method (default on Linux). `spawn` and `forkserver` are not
+  supported. Direct `multiprocessing.Process` usage is not covered.
+- **`python -S` flag:** child processes started with `python -S`
+  skip `sitecustomize.py` loading, so subprocess profiling is
+  silently disabled.
+- **C extensions:** C extension functions are skipped — there is
+  no Python bytecode to trace.
+- **Transient allocations:** `tracemalloc` shows net allocation
+  delta only. Allocations that are freed within the run appear
+  as ~0.
+
+See [benchmarks/README.md](../benchmarks/README.md) for detailed
+overhead measurements, methodology, and instructions for
+reproducing results.

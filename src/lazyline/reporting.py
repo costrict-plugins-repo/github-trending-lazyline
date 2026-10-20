@@ -1,0 +1,830 @@
+"""Terminal reporting for profiling results."""
+
+from __future__ import annotations
+
+import fnmatch
+import linecache
+import os
+import shutil
+import sys
+from typing import TYPE_CHECKING, Final, NamedTuple, TextIO
+
+from pygments import highlight as _pygments_highlight
+from pygments.formatters.terminal256 import (
+    Terminal256Formatter as _Terminal256Formatter,
+)
+from pygments.lexers.python import PythonLexer as _PythonLexer
+
+from lazyline.models import FunctionProfile, LineProfile
+
+if TYPE_CHECKING:
+    from pygments.formatter import Formatter
+    from pygments.lexer import Lexer
+
+_TOP_TIP_THRESHOLD: Final[int] = 50
+_MIN_NAME_WIDTH: Final[int] = 30
+_DEFAULT_WIDTH: Final[int] = 120
+_DIM_PIPE: Final[str] = "\033[2;90m│\033[0m"
+_BOLD_START: Final[str] = "\033[1m"
+_BOLD_END: Final[str] = "\033[0m"
+_DIM_START: Final[str] = "\033[2m"
+_DIM_END: Final[str] = "\033[0m"
+_MAX_NUM_WIDTH: Final[int] = 20
+_OVERFLOW: Final[str] = ">"
+
+
+def _make_highlighter(is_tty: bool) -> tuple[Lexer | None, Formatter | None]:
+    """Create Pygments lexer and formatter if outputting to a terminal."""
+    if is_tty:
+        return _PythonLexer(), _Terminal256Formatter(style="monokai")
+    return None, None
+
+
+def _highlight_source(
+    source: str, lexer: Lexer | None, formatter: Formatter | None
+) -> str:
+    """Syntax-highlight a source line for terminal display."""
+    if lexer is None or formatter is None or not source.strip():
+        return source
+    return _pygments_highlight(source, lexer, formatter).rstrip("\n")
+
+
+class _TimeUnit(NamedTuple):
+    """Display configuration for a time unit."""
+
+    label: str
+    multiplier: float
+    total_prec: int  # decimal places for summary totals / grand total
+    detail_prec: int  # decimal places for per-call, per-hit, per-line
+
+
+_UNITS: dict[str, _TimeUnit] = {
+    "s": _TimeUnit("s", 1, 4, 6),
+    "ms": _TimeUnit("ms", 1e3, 2, 4),
+    "us": _TimeUnit("us", 1e6, 1, 2),
+    "ns": _TimeUnit("ns", 1e9, 0, 1),
+}
+
+
+def _auto_select_unit(results: list[FunctionProfile]) -> _TimeUnit:
+    """Pick the best display unit based on the maximum total_time.
+
+    Using max ensures that the largest value is always displayed in a
+    human-readable range, avoiding multi-billion nanosecond numbers when
+    a single slow function dominates an otherwise fast profile.
+    """
+    if not results:
+        return _UNITS["s"]
+    peak = max(fp.total_time for fp in results)
+    if peak <= 0 or peak >= 1.0:
+        return _UNITS["s"]
+    if peak >= 1e-3:
+        return _UNITS["ms"]
+    if peak >= 1e-6:
+        return _UNITS["us"]
+    return _UNITS["ns"]
+
+
+def _fmt_num(value: float, width: int, prec: int) -> str:
+    """Format a float, truncating with '>' if it overflows *width*."""
+    s = f"{value:.{prec}f}"
+    if len(s) <= width:
+        return f"{s:>{width}}"
+    return _OVERFLOW + s[-(width - 1) :]
+
+
+def _compute_col_widths(
+    display: list[FunctionProfile], tu: _TimeUnit
+) -> tuple[int, int, int, int]:
+    """Compute minimum column widths from actual formatted values.
+
+    Returns
+    -------
+    tuple
+        (total_w, tpc_w, time_w, tph_w) — minimum widths for the
+        Total, Time/Call, per-line Time, and per-line Time/Hit columns.
+    """
+    m, tp, dp = tu.multiplier, tu.total_prec, tu.detail_prec
+    total_w = len(f"Total ({tu.label})")
+    tpc_w = len(f"Time/Call ({tu.label})")
+    time_w = len(f"Time ({tu.label})")
+    tph_w = len(f"Time/Hit ({tu.label})")
+    for fp in display:
+        total_w = max(total_w, len(f"{fp.total_time * m:.{tp}f}"))
+        tpc = fp.total_time / fp.call_count if fp.call_count > 0 else 0.0
+        tpc_w = max(tpc_w, len(f"{tpc * m:.{dp}f}"))
+        for lp in fp.lines:
+            if lp.hits > 0:
+                time_w = max(time_w, len(f"{lp.time * m:.{dp}f}"))
+                tph = lp.time / lp.hits
+                tph_w = max(tph_w, len(f"{tph * m:.{dp}f}"))
+    return (
+        min(total_w, _MAX_NUM_WIDTH),
+        min(tpc_w, _MAX_NUM_WIDTH),
+        min(time_w, _MAX_NUM_WIDTH),
+        min(tph_w, _MAX_NUM_WIDTH),
+    )
+
+
+def _get_width(stream: TextIO, width: int | None) -> int:
+    """Determine the effective terminal width for output formatting."""
+    if width is not None:
+        return width
+    try:
+        if stream.isatty():
+            return shutil.get_terminal_size().columns
+    except AttributeError:
+        pass
+    # Respect COLUMNS env var for non-tty output (pipes, files).
+    columns = os.environ.get("COLUMNS")
+    if columns is not None:
+        try:
+            return int(columns)
+        except ValueError:
+            pass
+    return _DEFAULT_WIDTH
+
+
+def _is_tty(stream: TextIO) -> bool:
+    """Check whether ANSI formatting should be used.
+
+    Returns ``False`` when the ``NO_COLOR`` environment variable is set
+    (any value), following the https://no-color.org/ convention.
+    """
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    try:
+        return stream.isatty()
+    except AttributeError:
+        return False
+
+
+def _warn_negative_times(results: list[FunctionProfile]) -> None:
+    """Warn to stderr if any functions have negative total_time."""
+    neg = [fp for fp in results if fp.total_time < 0]
+    if not neg:
+        return
+    names = ", ".join(f"{fp.module}.{fp.name}" for fp in neg[:3])
+    suffix = f" (and {len(neg) - 3} more)" if len(neg) > 3 else ""
+    print(
+        f"Warning: {len(neg)} function(s) have negative times"
+        f" ({names}{suffix}). Data may be corrupt.",
+        file=sys.stderr,
+    )
+
+
+def _normalize_patterns(raw: str) -> list[str]:
+    """Split comma-separated patterns and auto-wrap bare ones with ``*...*``."""
+    patterns = [p.strip() for p in raw.split(",")]
+    return [f"*{p}*" if not any(c in p for c in "*?[]") else p for p in patterns]
+
+
+_SORT_KEYS: Final = {
+    "time": lambda fp: -fp.total_time,
+    "calls": lambda fp: -fp.call_count,
+    "time-per-call": lambda fp: (
+        -(fp.total_time / fp.call_count if fp.call_count else 0)
+    ),
+    "name": lambda fp: f"{fp.module}.{fp.name}",
+}
+
+
+def _filter_and_select(
+    results: list[FunctionProfile],
+    filter_pattern: str | None,
+    exclude_pattern: str | None,
+    top: int | None,
+    sort: str = "time",
+) -> tuple[list[FunctionProfile] | None, list[FunctionProfile], str]:
+    """Apply filter, exclude, sort, and top-N selection.
+
+    Returns
+    -------
+    tuple
+        (filtered_results, display_results, empty_label) — *empty_label* is
+        the pattern string to show in the "No functions matching" message
+        when *filtered_results* is ``None``.
+    """
+    if filter_pattern is not None:
+        patterns = _normalize_patterns(filter_pattern)
+        results = [
+            fp
+            for fp in results
+            if any(fnmatch.fnmatch(f"{fp.module}.{fp.name}", p) for p in patterns)
+        ]
+        if not results:
+            return None, [], filter_pattern
+    if exclude_pattern is not None:
+        patterns = _normalize_patterns(exclude_pattern)
+        results = [
+            fp
+            for fp in results
+            if not any(fnmatch.fnmatch(f"{fp.module}.{fp.name}", p) for p in patterns)
+        ]
+        if not results:
+            return None, [], exclude_pattern
+    if sort != "time":
+        results = sorted(results, key=_SORT_KEYS[sort])
+    display = results[:top] if top is not None else results
+    return results, display, ""
+
+
+def _print_header_block(
+    scope: str,
+    n_called: int,
+    n_registered: int | None,
+    grand_total: float,
+    tu: _TimeUnit,
+    unit: str,
+    stream: TextIO,
+    is_tty: bool = False,
+    wall_time: float | None = None,
+    has_parallel: bool = False,
+) -> None:
+    """Print the results header block (scope, coverage, total, unit)."""
+    if n_registered is not None:
+        coverage = f"{n_called} of {n_registered} functions called"
+    else:
+        s = "s" if n_called != 1 else ""
+        coverage = f"{n_called} function{s}"
+    total_str = (
+        f"{grand_total * tu.multiplier:.{tu.total_prec}f}"[:_MAX_NUM_WIDTH] + tu.label
+    )
+    # Use "Profiled time" when total differs significantly from wall time.
+    if wall_time is not None and wall_time > 0:
+        ratio = grand_total / wall_time
+        total_label = "Total" if 0.9 <= ratio <= 1.1 else "Profiled time"
+    else:
+        total_label = "Total"
+    unit_str = f"{tu.label} (auto)" if unit == "auto" else tu.label
+    prefix = "\U0001f525 " if is_tty else ""
+    print(f"  {prefix}Lazyline results for {scope}", file=stream)
+    if wall_time is not None:
+        wall_fmt = (
+            f"{wall_time * tu.multiplier:.{tu.total_prec}f}"[:_MAX_NUM_WIDTH] + tu.label
+        )
+        wall_str = f" | Wall time: {wall_fmt}"
+    else:
+        wall_str = ""
+    print(
+        f"  {coverage} | {total_label}: {total_str}{wall_str} | Unit: {unit_str}",
+        file=stream,
+    )
+    if (
+        has_parallel
+        and wall_time is not None
+        and wall_time > 0
+        and grand_total > wall_time * 1.5
+    ):
+        print("  (total includes parallel worker time)", file=stream)
+    elif wall_time is not None and wall_time > 0 and grand_total < wall_time * 0.5:
+        print(
+            "  (most time was spent in un-profiled code"
+            " — C extensions, un-scoped modules)",
+            file=stream,
+        )
+
+
+def _validate_print_options(unit: str, sort: str) -> None:
+    """Validate unit and sort parameters for ``print_summary``."""
+    if unit != "auto" and unit not in _UNITS:
+        raise ValueError("unit must be one of: s, ms, us, ns or 'auto'")
+    if sort not in _SORT_KEYS:
+        raise ValueError(f"sort must be one of: {', '.join(_SORT_KEYS)} or omitted")
+
+
+def _print_summary_table(
+    display: list[FunctionProfile],
+    non_module: list[FunctionProfile],
+    grand_total: float,
+    tu: _TimeUnit,
+    name_width: int,
+    total_w: int,
+    tpc_w: int,
+    show_memory: bool,
+    sep: str,
+    term_width: int,
+    stream: TextIO,
+) -> bool:
+    """Print summary table rows and total.
+
+    Returns whether any ``<module>`` entry was displayed.
+    """
+    tp, dp = tu.total_prec, tu.detail_prec
+    m = tu.multiplier
+    has_module_entry = False
+    for fp in display:
+        pct = (fp.total_time / grand_total * 100) if grand_total > 0 else 0.0
+        is_module = fp.name == "<module>" and bool(non_module)
+        if is_module:
+            has_module_entry = True
+        name = _qualified_name(fp, max_len=name_width - 1)
+        mem_str = f"{sep}{_format_memory(fp.memory):>10}" if show_memory else ""
+        tpc = fp.total_time / fp.call_count if fp.call_count > 0 else 0.0
+        pct_marker = "*" if is_module else "%"
+        line = (
+            f"{name:<{name_width}}{sep}{_fmt_num(fp.total_time * m, total_w, tp)}"
+            f"{sep}{pct:>7.1f}{pct_marker}"
+        )
+        tpc_str = _fmt_num(tpc * m, tpc_w, dp)
+        print(
+            f"{line}{sep}{fp.call_count:>8}{sep}{tpc_str}{mem_str}",
+            file=stream,
+        )
+
+    print("-" * term_width, file=stream)
+    print(
+        f"{'Total':<{name_width}}{sep}{_fmt_num(grand_total * m, total_w, tp)}",
+        file=stream,
+    )
+    return has_module_entry
+
+
+def print_summary(
+    results: list[FunctionProfile],
+    *,
+    top: int | None = None,
+    compact: bool = True,
+    summary: bool = False,
+    filter_pattern: str | None = None,
+    exclude_pattern: str | None = None,
+    stream: TextIO | None = None,
+    width: int | None = None,
+    unit: str = "auto",
+    sort: str = "time",
+    scope: str | None = None,
+    n_registered: int | None = None,
+    wall_time: float | None = None,
+    has_parallel: bool = False,
+) -> None:
+    """Print a ranked summary of profiling results.
+
+    Parameters
+    ----------
+    results
+        Function profiles sorted by total time (descending).
+    top
+        If set, only show the top N functions.
+    compact
+        If True, collapse consecutive un-hit lines into ``...``.
+    summary
+        If True, print only the summary table (no per-line detail).
+    filter_pattern
+        If set, only show functions whose qualified name matches
+        the given fnmatch pattern (e.g., ``"*Matcher*"``).
+    exclude_pattern
+        If set, exclude functions whose qualified name matches.
+    stream
+        Output stream. Defaults to ``sys.stdout``.
+    width
+        Terminal width override. Auto-detected when ``None``.
+    unit
+        Time display unit: ``"s"``, ``"ms"``, ``"us"``, ``"ns"``, or ``"auto"``.
+    sort
+        Sort order: ``"time"``, ``"calls"``, ``"time-per-call"``, or ``"name"``.
+    scope
+        Scope name for the results header block. When ``None``, no header is shown.
+    n_registered
+        Total registered functions for coverage display (``N of M``).
+    wall_time
+        Wall-clock execution time in seconds, displayed in the header.
+    has_parallel
+        Whether parallel worker or subprocess stats were collected.
+        Controls the "total includes parallel worker time" note.
+    """
+    _validate_print_options(unit, sort)
+
+    stream = stream or sys.stdout
+
+    term_width = _get_width(stream, width)
+    tty = _is_tty(stream)
+    lexer, formatter = _make_highlighter(tty)
+    if tty:
+        sep, dsep = _DIM_PIPE, f" {_DIM_PIPE}"
+        stats_sep = f" {_DIM_PIPE} "
+    else:
+        sep, dsep = " ", "  "
+        stats_sep = " | "
+
+    banner = "=" * term_width
+
+    print("", file=stream)
+    print(banner, file=stream)
+
+    if not results:
+        print("\nNo profiling data collected.", file=stream)
+        return
+
+    _warn_negative_times(results)
+    # Exclude <module> entries from grand total — their time is inclusive
+    # (already counted via the functions they call), so including them
+    # would inflate the total.  Fall back to full sum when every result
+    # is a <module> entry (flat scripts with no function definitions).
+    # Caveat: this under-counts direct top-level work (e.g. loops at module
+    # scope) when the module also calls profiled functions.
+    non_module = [fp for fp in results if fp.name != "<module>"]
+    grand_total = (
+        sum(fp.total_time for fp in non_module)
+        if non_module
+        else sum(fp.total_time for fp in results)
+    )
+    n_called = len(results)
+
+    filtered, display, empty_label = _filter_and_select(
+        results, filter_pattern, exclude_pattern, top, sort
+    )
+    if filtered is None:
+        print(f"No functions matching '{empty_label}'.", file=stream)
+        return
+    results = filtered
+    show_memory = any(fp.memory is not None for fp in results)
+
+    tu = _auto_select_unit(display) if unit == "auto" else _UNITS[unit]
+    total_w, tpc_w, time_w, tph_w = _compute_col_widths(display, tu)
+    tph_w += 2  # Extra padding for readability.
+    # Ensure grand total fits in the Total column too (capped).
+    grand_fmt_w = min(
+        len(f"{grand_total * tu.multiplier:.{tu.total_prec}f}"), _MAX_NUM_WIDTH
+    )
+    total_w = max(total_w, grand_fmt_w)
+    # Fixed numeric columns: ' '+total_w+' '+8(%Total)+' '+8(Calls)+' '+tpc_w
+    fixed = 4 + total_w + 16 + tpc_w + (11 if show_memory else 0)
+    name_width = max(term_width - fixed, _MIN_NAME_WIDTH)
+    # Widen term_width for separators/banner if MIN_NAME_WIDTH caused overflow.
+    term_width = max(term_width, name_width + fixed)
+    banner = "=" * term_width
+
+    if scope is not None:
+        _print_header_block(
+            scope,
+            n_called,
+            n_registered,
+            grand_total,
+            tu,
+            unit,
+            stream,
+            tty,
+            wall_time,
+            has_parallel,
+        )
+
+    total_hdr = f"Total ({tu.label})"
+    tpc_hdr = f"Time/Call ({tu.label})"
+    mem_col = f"{sep}{'Net Mem':>10}" if show_memory else ""
+
+    if top is not None and top < len(results):
+        print(
+            f"\nShowing top {len(display)} of {len(results)} functions.",
+            file=stream,
+        )
+
+    print("", file=stream)
+    print("Summary", file=stream)
+    print("", file=stream)
+    print(
+        f"{'Function':<{name_width}}{sep}{total_hdr:>{total_w}}{sep}{'% Total':>8}"
+        f"{sep}{'Calls':>8}{sep}{tpc_hdr:>{tpc_w}}{mem_col}",
+        file=stream,
+    )
+    print("-" * term_width, file=stream)
+
+    has_module_entry = _print_summary_table(
+        display,
+        non_module,
+        grand_total,
+        tu,
+        name_width,
+        total_w,
+        tpc_w,
+        show_memory,
+        sep,
+        term_width,
+        stream,
+    )
+    if has_module_entry:
+        print(
+            "* <module> time is inclusive (includes called functions); "
+            "excluded from Total",
+            file=stream,
+        )
+    print("", file=stream)
+
+    if summary:
+        return
+
+    print("Functions", file=stream)
+    print("", file=stream)
+    for fp in display:
+        _print_function_detail(
+            fp,
+            stream=stream,
+            show_memory=show_memory,
+            compact=compact,
+            term_width=term_width,
+            tu=tu,
+            time_w=time_w,
+            tph_w=tph_w,
+            dsep=dsep,
+            is_tty=tty,
+            stats_sep=stats_sep,
+            lexer=lexer,
+            formatter=formatter,
+        )
+
+    if n_registered is not None and n_registered > _TOP_TIP_THRESHOLD and top is None:
+        print("Tip: use --top N to limit output.", file=sys.stderr)
+
+
+def _print_function_detail(
+    fp: FunctionProfile,
+    *,
+    stream: TextIO,
+    show_memory: bool = False,
+    compact: bool = False,
+    term_width: int = _DEFAULT_WIDTH,
+    tu: _TimeUnit = _UNITS["s"],
+    time_w: int = 10,
+    tph_w: int = 13,
+    dsep: str = "  ",
+    is_tty: bool = False,
+    stats_sep: str = " | ",
+    lexer: Lexer | None = None,
+    formatter: Formatter | None = None,
+) -> None:
+    """Print per-line detail for a single function, showing full source."""
+    if not fp.lines:
+        return
+
+    func_total = fp.total_time
+    qual_name = f"{fp.module}.{fp.name}"
+    short_path = _shorten_path(fp.filename, fp.module)
+    loc = f"({short_path}:{fp.start_line})"
+    header = f"{qual_name} {loc}"
+    if len(header) > term_width:
+        # Truncate the file path from the left to keep filename:line visible.
+        prefix = f"{qual_name} ("
+        suffix = f":{fp.start_line})"
+        available = term_width - len(prefix) - len(suffix)
+        if available > 3:
+            path = "..." + short_path[-(available - 3) :]
+            loc = f"({path}{suffix}"
+            header = f"{qual_name} {loc}"
+        else:
+            header = header[: term_width - 3] + "..."
+    if is_tty:
+        # Bold the qualified name only, not the file path.
+        bold_name = f"{_BOLD_START}{qual_name}{_BOLD_END}"
+        print(header.replace(qual_name, bold_name, 1), file=stream)
+    else:
+        print(header, file=stream)
+
+    tp, dp = tu.total_prec, tu.detail_prec
+    m = tu.multiplier
+    tpc = func_total / fp.call_count if fp.call_count > 0 else 0.0
+    fmt_total = f"{func_total * m:.{tp}f}"[:_MAX_NUM_WIDTH]
+    fmt_tpc = f"{tpc * m:.{dp}f}"[:_MAX_NUM_WIDTH]
+    stats_parts = [
+        f"{fmt_total}{tu.label} total",
+        f"{fp.call_count} call{'s' if fp.call_count != 1 else ''}",
+        f"{fmt_tpc}{tu.label}/call",
+    ]
+    if show_memory and fp.memory is not None:
+        stats_parts.append(f"{_format_memory(fp.memory)} net mem")
+    print(stats_sep.join(stats_parts), file=stream)
+    print("", file=stream)
+
+    time_hdr = f"Time ({tu.label})"
+    tph_hdr = f"Time/Hit ({tu.label})"
+    mem_hdr = f"{dsep}{'Net Mem':>10}" if show_memory else ""
+    cols = (
+        f"{'Line':>6}{dsep}{'Hits':>8}"
+        f"{dsep}{time_hdr:>{time_w}}{dsep}{tph_hdr:>{tph_w}}"
+        f"{dsep}{'% Func':>8}{mem_hdr}{dsep}{'Source'}"
+    )
+    print(cols, file=stream)
+    print("-" * term_width, file=stream)
+
+    lines = _prepare_lines(fp, compact)
+    # Find the hottest line (highest time among hit lines) for visual marking.
+    hottest_lineno = _find_hottest_lineno(lines)
+    for i, lp in enumerate(lines):
+        if lp is _ELLIPSIS_SENTINEL:
+            _print_ellipsis(stream, show_memory, time_w, tph_w, dsep)
+        else:
+            # In compact mode, don't dim the header (first line) or def
+            # lines — they anchor the reader even with zero hits.
+            assert isinstance(lp, LineProfile)
+            is_def_line = lp.source.lstrip().startswith(("def ", "async def "))
+            dim_unhit = is_tty and not (compact and (i == 0 or is_def_line))
+            is_hot = is_tty and lp.lineno == hottest_lineno
+            _print_line(
+                lp,
+                func_total,
+                stream,
+                show_memory,
+                tu,
+                time_w,
+                tph_w,
+                dsep,
+                dim_unhit,
+                lexer,
+                formatter,
+                is_hot,
+            )
+
+    print("", file=stream)
+    print("", file=stream)
+
+
+_ELLIPSIS_SENTINEL = object()
+
+
+def _find_hottest_lineno(lines: list[LineProfile | object]) -> int | None:
+    """Return the lineno of the line with the most time, or None."""
+    best_time = 0.0
+    best_lineno: int | None = None
+    for lp in lines:
+        if isinstance(lp, LineProfile) and lp.hits > 0 and lp.time > best_time:
+            best_time = lp.time
+            best_lineno = lp.lineno
+    return best_lineno
+
+
+def _flush_unhit(buffer: list[LineProfile], result: list[LineProfile | object]) -> None:
+    """Flush unhit lines: show singles inline, collapse 2+ to ellipsis."""
+    if len(buffer) == 1:
+        result.append(buffer[0])
+    elif len(buffer) > 1:
+        result.append(_ELLIPSIS_SENTINEL)
+
+
+def _prepare_lines(fp: FunctionProfile, compact: bool) -> list[LineProfile | object]:
+    """Build the list of lines to print, inserting ellipsis markers in compact mode."""
+    if any(lp.source for lp in fp.lines):
+        raw_lines: list[LineProfile | object] = fp.lines  # ty: ignore
+    else:
+        raw_lines = _fill_source_from_cache(fp)
+
+    if not compact:
+        return raw_lines  # ty: ignore[invalid-return-type]
+
+    # Compact: keep header (first line), def/async def lines, and hit lines.
+    # Collapse 2+ consecutive un-hit lines into an ellipsis marker, but show
+    # single un-hit lines inline (eliding one line saves no space and is
+    # misleading).
+    result: list[LineProfile | object] = []
+    unhit_buffer: list[LineProfile] = []
+
+    for i, lp in enumerate(raw_lines):
+        is_header = i == 0
+        is_def = lp.source.lstrip().startswith(("def ", "async def "))
+        is_hit = lp.hits > 0
+        if is_header or is_def or is_hit:
+            _flush_unhit(unhit_buffer, result)
+            unhit_buffer = []
+            result.append(lp)
+        else:
+            unhit_buffer.append(lp)
+
+    _flush_unhit(unhit_buffer, result)
+    return result
+
+
+_SAFE_SOURCE_SUFFIXES: Final[frozenset[str]] = frozenset({".py", ".pyw"})
+
+
+def _fill_source_from_cache(fp: FunctionProfile) -> list[LineProfile]:
+    """Build lines with source from linecache (legacy/non-enriched path).
+
+    Only reads from linecache when the filename has a Python extension
+    to prevent arbitrary file reads from crafted JSON inputs.
+    """
+    safe = any(fp.filename.endswith(s) for s in _SAFE_SOURCE_SUFFIXES)
+    timing_by_line = {lp.lineno: lp for lp in fp.lines}
+    last_profiled_line = max(lp.lineno for lp in fp.lines)
+    result: list[LineProfile] = []
+    for lineno in range(fp.start_line, last_profiled_line + 1):
+        source = linecache.getline(fp.filename, lineno).rstrip() if safe else ""
+        lp = timing_by_line.get(lineno)
+        if lp is not None:
+            result.append(
+                LineProfile(
+                    lineno=lineno,
+                    hits=lp.hits,
+                    time=lp.time,
+                    source=source,
+                    memory=lp.memory,
+                )
+            )
+        else:
+            result.append(LineProfile(lineno=lineno, hits=0, time=0.0, source=source))
+    return result
+
+
+def _shorten_path(filename: str, module: str) -> str:
+    """Shorten a file path by stripping the prefix before the root package.
+
+    Given ``module="my_package.extract"`` and a filename like
+    ``/home/user/.venv/.../my_package/extract.py``, returns
+    ``my_package/extract.py``. Uses ``rfind`` so that if the root
+    name appears earlier in the path (e.g., ``/home/my_package/...``), the
+    last (correct) occurrence is used.
+    """
+    root = module.split(".")[0]
+    sep = "/" + root + "/"
+    idx = filename.rfind(sep)
+    if idx != -1:
+        return filename[idx + 1 :]
+    return filename
+
+
+def _qualified_name(fp: FunctionProfile, max_len: int = 69) -> str:
+    """Build a qualified function name, truncating at dot boundaries."""
+    name = f"{fp.module}.{fp.name}"
+    if len(name) <= max_len:
+        return name
+    if max_len <= 3:
+        return name[:max_len]
+    tail = name[-(max_len - 3) :]
+    # Snap to the next dot boundary to avoid cutting mid-word.
+    dot = tail.find(".")
+    if dot != -1 and dot < len(tail) - 1:
+        tail = tail[dot + 1 :]
+    return "..." + tail
+
+
+def _print_line(
+    lp: LineProfile,
+    func_total: float,
+    stream: TextIO,
+    show_memory: bool,
+    tu: _TimeUnit = _UNITS["s"],
+    time_w: int = 10,
+    tph_w: int = 13,
+    dsep: str = "  ",
+    dim_unhit: bool = False,
+    lexer: Lexer | None = None,
+    formatter: Formatter | None = None,
+    is_hot: bool = False,
+) -> None:
+    """Print a single profiled line (hit or non-hit)."""
+    if lp.hits > 0:
+        pct = (lp.time / func_total * 100) if func_total > 0 else 0.0
+        tph = lp.time / lp.hits if lp.hits > 0 else 0.0
+        dp = tu.detail_prec
+        m = tu.multiplier
+        mem_str = f"{dsep}{_format_memory(lp.memory):>10}" if show_memory else ""
+        t_str = _fmt_num(lp.time * m, time_w, dp)
+        h_str = _fmt_num(tph * m, tph_w, dp)
+        source = _highlight_source(lp.source, lexer, formatter)
+        # Mark the hottest line with >> prefix (TTY only, via is_hot).
+        prefix = f"{_BOLD_START}>>{_BOLD_END}" if is_hot else "  "
+        cols = f"{prefix}{lp.lineno:>4}{dsep}{lp.hits:>8}{dsep}{t_str}{dsep}{h_str}"
+        print(f"{cols}{dsep}{pct:>7.1f}%{mem_str}{dsep}{source}", file=stream)
+    else:
+        # Use plain separators for un-hit lines so the outer dim ANSI is
+        # not interrupted by the reset inside _DIM_PIPE.
+        plain = "  " if dim_unhit else dsep
+        mem_pad = f"{plain}{'':>10}" if show_memory else ""
+        # Highlight non-dimmed un-hit lines (e.g. def line in compact mode).
+        source = (
+            lp.source if dim_unhit else _highlight_source(lp.source, lexer, formatter)
+        )
+        line = (
+            f"{lp.lineno:>6}{plain}{'':>8}{plain}{'':>{time_w}}{plain}{'':>{tph_w}}"
+            f"{plain}{'':>8}{mem_pad}{plain}{source}"
+        )
+        if dim_unhit:
+            line = f"{_DIM_START}{line}{_DIM_END}"
+        print(line, file=stream)
+
+
+def _print_ellipsis(
+    stream: TextIO,
+    show_memory: bool,
+    time_w: int = 10,
+    tph_w: int = 13,
+    dsep: str = "  ",
+) -> None:
+    """Print a collapsed-lines marker for compact mode."""
+    mem_pad = f"{dsep}{'':>10}" if show_memory else ""
+    print(
+        f"{'':>6}{dsep}{'':>8}{dsep}{'':>{time_w}}{dsep}{'':>{tph_w}}"
+        f"{dsep}{'':>8}{mem_pad}{dsep}...",
+        file=stream,
+    )
+
+
+def _format_memory(nbytes: float | None) -> str:
+    """Format a byte count for display, auto-scaling to B/KB/MB/GB."""
+    if nbytes is None:
+        return ""
+    sign = "-" if nbytes < 0 else ""
+    value = abs(nbytes)
+    if value < 1024:
+        return f"{sign}{value:.0f} B"
+    if value < 1024 * 1024:
+        return f"{sign}{value / 1024:.1f} KB"
+    if value < 1024 * 1024 * 1024:
+        return f"{sign}{value / (1024 * 1024):.1f} MB"
+    return f"{sign}{value / (1024 * 1024 * 1024):.1f} GB"
